@@ -1,0 +1,115 @@
+# Authored by Seal: upstream golang.org/x/net ships no GitHub Actions CI at all,
+# so there is no workflow to extend. Commands are taken from the repo itself:
+# go.mod declares `go 1.24.0`, and the project is a plain multi-package Go module
+# built and tested with `go build ./...` / `go test ./...`.
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated Go test names to run instead of the full suite"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: src
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # go.mod's floor is 1.24.0, but http2's test files are gated behind
+          # `//go:build go1.25 || goexperiment.synctest` — on 1.24 the whole
+          # http2 suite compiles away and reports ok in 6ms. 1.25 was the
+          # current toolchain at the v0.45.0 release and runs those tests.
+          go-version: "1.25"
+          cache: false
+
+      - name: Download module dependencies
+        working-directory: src
+        run: go mod download
+
+      # The module zip is packed from the source tree, so this workflow file —
+      # which upstream does not ship — must not become a member of it.
+      # Upstream has no other .github content, so the whole directory goes.
+      - name: Drop Seal CI plumbing from the tree before packing
+        working-directory: src
+        run: rm -rf .github
+
+      # golang.org/x/mod/zip.CreateFromDir is Go's own module-zip implementation
+      # and applies the proxy's exact inclusion rules, so the member set matches
+      # proxy.golang.org by construction.
+      - name: Build module zip
+        run: |
+          set -euo pipefail
+          mkdir -p build_output "${RUNNER_TEMP}/modzip"
+          cat > "${RUNNER_TEMP}/modzip/create_mod.go" <<'EOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              if len(os.Args) != 5 {
+                  log.Fatal("usage: create_mod <module-path> <version> <source-dir> <output-zip>")
+              }
+              m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+              f, err := os.Create(os.Args[4])
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer f.Close()
+              if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+                  log.Fatal(err)
+              }
+              log.Printf("created module zip: %s", os.Args[4])
+          }
+          EOF
+          cd "${RUNNER_TEMP}/modzip"
+          go mod init example.com/modzip
+          go get golang.org/x/mod@latest
+          go run ./create_mod.go golang.org/x/net v0.45.0 "${GITHUB_WORKSPACE}/src" "${GITHUB_WORKSPACE}/build_output/v0.45.0.zip"
+
+      - name: List module zip contents
+        run: unzip -l build_output/v0.45.0.zip | head -40
+
+      - name: Build
+        working-directory: src
+        run: go build ./...
+
+      - name: Test
+        working-directory: src
+        run: |
+          set -eo pipefail
+          filter="${{ inputs.test-filter }}"
+          if [ -n "${filter}" ]; then
+            go test -v -run "^($(echo "${filter}" | tr ' ' '|'))$" ./... 2>&1 | tee /tmp/scoped.log
+            for t in ${filter}; do
+              grep -qE "^=== RUN[[:space:]]+${t}(/|\$)" /tmp/scoped.log || exit 1
+            done
+          else
+            go test ./...
+          fi
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: build_output/v0.45.0.zip
+          if-no-files-found: error
