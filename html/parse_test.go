@@ -303,6 +303,141 @@ func TestParserWithoutScripting(t *testing.T) {
 	}
 }
 
+// TestInBodyEndTagOtherForeignNamespace checks that the "any other end tag"
+// algorithm of the "in body" insertion mode never closes an element in a
+// foreign (SVG or MathML) namespace. Closing one truncates the stack of open
+// elements at that foreign element, which escapes the surrounding HTML
+// integration point and yields a tree that differs from the one a browser
+// builds: markup that looks inert to a sanitizer walking the tree comes back
+// to life once the tree is rendered and re-parsed.
+func TestInBodyEndTagOtherForeignNamespace(t *testing.T) {
+	// The trailing markup is inert while it is parsed with HTML rules inside
+	// the integration point (the <style> element is raw text, so "<!--" is
+	// merely its text), but is parsed very differently once the end tag has
+	// broken the parser out of foreign content.
+	const payload = `<style><!--</style><img src=1 onerror=alert(1)>-->`
+	for _, tc := range []struct {
+		name, namespace, text string
+	}{
+		{"svg desc", "svg", `<svg><desc><span></desc>` + payload},
+		{"svg title", "svg", `<svg><title><span></title>` + payload},
+		{"mathml mtext", "math", `<math><mtext><span></mtext>` + payload},
+		{"mathml mi", "math", `<math><mi><span></mi>` + payload},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// The end tag must be ignored, so the whole payload stays inside
+			// the foreign subtree, both when parsing the original input and
+			// when re-parsing a rendering of the resulting tree.
+			text := tc.text
+			for _, pass := range []string{"parse", "render and re-parse"} {
+				doc, err := Parse(strings.NewReader(text))
+				if err != nil {
+					t.Fatalf("%s %q: %v", pass, text, err)
+				}
+				var img *Node
+				for n := range doc.Descendants() {
+					if n.Type == ElementNode && n.DataAtom == atom.Img {
+						img = n
+						break
+					}
+				}
+				if img == nil {
+					t.Fatalf("%s %q: no <img> element in the parse tree", pass, text)
+				}
+				escaped := true
+				for anc := range img.Ancestors() {
+					if anc.Namespace == tc.namespace {
+						escaped = false
+						break
+					}
+				}
+				if escaped {
+					got, err := dump(doc)
+					if err != nil {
+						t.Fatal(err)
+					}
+					t.Fatalf("%s %q: <img> escaped the %q namespace:\n----\n%s----", pass, text, tc.namespace, got)
+				}
+
+				var b bytes.Buffer
+				if err := Render(&b, doc); err != nil {
+					t.Fatalf("%s %q: Render: %v", pass, text, err)
+				}
+				text = b.String()
+			}
+		})
+	}
+}
+
+// TestInBodyEndTagOtherNamespaceGuard runs the "any other end tag" algorithm on
+// the stack of open elements that the inputs of
+// TestInBodyEndTagOtherForeignNamespace leave behind, and checks that the
+// namespace of the element is the only thing that keeps the end tag from
+// closing it: the end tag matches the foreign element by tag name, and the
+// scan does reach it.
+func TestInBodyEndTagOtherNamespaceGuard(t *testing.T) {
+	// matchesTagName is the part of the condition that compares an open
+	// element to the end tag. It is not enough on its own, because an element
+	// in a foreign namespace can carry the tag name of an HTML element.
+	matchesTagName := func(n *Node, tagAtom atom.Atom, tagName string) bool {
+		return (n.DataAtom == tagAtom) && ((tagAtom != 0) || (n.Data == tagName))
+	}
+	for _, tc := range []struct{ namespace, tagName, text string }{
+		{"svg", "desc", `<svg><desc><span>`},
+		{"svg", "title", `<svg><title><span>`},
+		{"math", "mtext", `<math><mtext><span>`},
+		{"math", "mi", `<math><mi><span>`},
+	} {
+		t.Run(tc.namespace+" "+tc.tagName, func(t *testing.T) {
+			// Rebuild the stack of open elements from the parse tree of
+			// tc.text: for these inputs it is every element of the tree but
+			// the empty <head>, in document order.
+			doc, err := Parse(strings.NewReader(tc.text))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var oe nodeStack
+			for n := range doc.Descendants() {
+				if n.Type == ElementNode && n.DataAtom != atom.Head {
+					oe = append(oe, n)
+				}
+			}
+			// <html>, <body>, the foreign root, the integration point and the
+			// <span> inside it.
+			if len(oe) != 5 || oe[4].Data != "span" {
+				got, err := dump(doc)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Fatalf("%q: unexpected stack of open elements:\n----\n%s----", tc.text, got)
+			}
+			foreign := oe[3]
+			if foreign.Namespace != tc.namespace || foreign.Data != tc.tagName {
+				t.Fatalf("%q: got <%s %s> below the <span>, want <%s %s>", tc.text, foreign.Namespace, foreign.Data, tc.namespace, tc.tagName)
+			}
+
+			// The tokenizer lower-cases tag names, so this is the atom the
+			// "</desc>" (etc.) end tag token carries.
+			tagAtom := atom.Lookup([]byte(tc.tagName))
+			if !matchesTagName(foreign, tagAtom, tc.tagName) {
+				t.Fatalf("the <%s %s> element does not match the %q end tag by tag name", tc.namespace, tc.tagName, tc.tagName)
+			}
+			for _, n := range oe[4:] {
+				if isSpecialElement(n) {
+					t.Fatalf("<%s> is a special element, so the scan stops above the <%s %s> element", n.Data, tc.namespace, tc.tagName)
+				}
+			}
+
+			p := &parser{oe: oe}
+			p.inBodyEndTagOther(tagAtom, tc.tagName)
+			if len(p.oe) != len(oe) {
+				t.Errorf("the %q end tag closed the <%s %s> element: the stack of open elements went from %d to %d entries",
+					tc.tagName, tc.namespace, tc.tagName, len(oe), len(p.oe))
+			}
+		})
+	}
+}
+
 // testParseCase tests one test case from the test files. If the test does not
 // pass, it returns an error that explains the failure.
 // text is the HTML to be parsed, want is a dump of the correct parse tree,
